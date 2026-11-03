@@ -1,4 +1,4 @@
-name: Find Smallest 1000 Chrome Extension IDs With Keys
+name: id+key_ Find Smallest 1000 Chrome Extension IDs With Keys
 
 on:
   workflow_dispatch:
