@@ -1,4 +1,4 @@
-name: Find Smallest Chrome Extension ID
+name: Find Smallest 1000 Chrome Extension IDs
 
 on:
   workflow_dispatch:
@@ -7,25 +7,72 @@ jobs:
   find:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
-      - name: Clone manifest dataset
+      - name: Download latest dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git clone --depth 1 \
-            https://github.com/ishandutta2007/chrome-extension-manifests-dataset.git \
-            dataset
+          mkdir -p data
 
-      - name: Install dependencies
-        working-directory: dataset
-        run: npm install
+          gh release download \
+            --repo bored-engineer/chrome-extensions \
+            --pattern "sitemaps.tar.bz2" \
+            --dir data
 
-      - name: Find smallest ID
-        working-directory: dataset
+      - name: Extract and find smallest 1000 IDs
         run: |
-          node query.js \
-            -o "id,metadata.name,manifest.key" \
-            -f "typeof manifest.key === 'string' && manifest.key.length > 0" \
-            "true" \
-            > ../result.txt
+          python3 - <<'PY'
+          import tarfile
+          from pathlib import Path
+
+          archive = Path("data/sitemaps.tar.bz2")
+
+          with tarfile.open(archive, "r:bz2") as tar:
+              member = next(
+                  (m for m in tar.getmembers()
+                   if Path(m.name).name == "extensions.txt"),
+                  None
+              )
+
+              if member is None:
+                  raise SystemExit("extensions.txt not found")
+
+              file = tar.extractfile(member)
+
+              if file is None:
+                  raise SystemExit("Cannot read extensions.txt")
+
+              ids = {
+                  line.strip()
+                  for line in file.read().decode("utf-8").splitlines()
+                  if len(line.strip()) == 32
+                  and all('a' <= c <= 'p' for c in line.strip())
+              }
+
+          print("Total unique extension IDs:", len(ids), flush=True)
+
+          if not ids:
+              raise SystemExit("No extension IDs found")
+
+          top1000 = sorted(ids)[:1000]
+
+          print()
+          print("Smallest 1000 extension IDs:")
+
+          for i, extension_id in enumerate(top1000, 1):
+              print(f"{i:4d}. {extension_id}", flush=True)
+
+          Path("result.txt").write_text(
+              "\n".join(
+                  f"{i}\t{extension_id}"
+                  for i, extension_id in enumerate(top1000, 1)
+              ) + "\n",
+              encoding="utf-8"
+          )
+          PY
 
       - name: Show result
         run: |
@@ -35,15 +82,15 @@ jobs:
       - name: Write summary
         run: |
           {
-            echo "# Smallest Chrome Extension ID"
+            echo "# Smallest 1000 Chrome Extension IDs"
             echo
             echo '```text'
-            head -n 1 result.txt
+            cat result.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
-          name: smallest-extension-id
+          name: smallest-1000-extension-ids
           path: result.txt
