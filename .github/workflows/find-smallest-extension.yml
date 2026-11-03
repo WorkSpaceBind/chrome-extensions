@@ -1,0 +1,49 @@
+name: Find Smallest Chrome Extension ID
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone manifest dataset
+        run: |
+          git clone --depth 1 \
+            https://github.com/ishandutta2007/chrome-extension-manifests-dataset.git \
+            dataset
+
+      - name: Install dependencies
+        working-directory: dataset
+        run: npm install
+
+      - name: Find smallest ID
+        working-directory: dataset
+        run: |
+          node query.js \
+            -o "id,metadata.name,manifest.key" \
+            -f "typeof manifest.key === 'string' && manifest.key.length > 0" \
+            "true" \
+            > ../result.txt
+
+      - name: Show result
+        run: |
+          echo "===== RESULT ====="
+          cat result.txt
+
+      - name: Write summary
+        run: |
+          {
+            echo "# Smallest Chrome Extension ID"
+            echo
+            echo '```text'
+            head -n 1 result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: smallest-extension-id
+          path: result.txt
