@@ -1,0 +1,347 @@
+name: Find Smallest 1000 Chrome Extension IDs With Keys
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download latest dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+
+          gh release download \
+            --repo bored-engineer/chrome-extensions \
+            --pattern "sitemaps.tar.bz2" \
+            --dir data
+
+      - name: Find IDs and extract public keys
+        run: |
+          python3 - <<'PY'
+          import tarfile
+          import hashlib
+          import base64
+          import struct
+          import urllib.request
+          import time
+          from pathlib import Path
+
+          # ============================================================
+          # 1. 读取 extensions.txt
+          # ============================================================
+
+          archive = Path("data/sitemaps.tar.bz2")
+
+          with tarfile.open(archive, "r:bz2") as tar:
+              member = next(
+                  (
+                      m for m in tar.getmembers()
+                      if Path(m.name).name == "extensions.txt"
+                  ),
+                  None
+              )
+
+              if member is None:
+                  raise SystemExit("extensions.txt not found")
+
+              file = tar.extractfile(member)
+
+              if file is None:
+                  raise SystemExit("Cannot read extensions.txt")
+
+              ids = {
+                  line.strip()
+                  for line in file.read().decode("utf-8").splitlines()
+                  if len(line.strip()) == 32
+                  and all('a' <= c <= 'p' for c in line.strip())
+              }
+
+          print("Total unique extension IDs:", len(ids), flush=True)
+
+          if not ids:
+              raise SystemExit("No extension IDs found")
+
+          top1000 = sorted(ids)[:1000]
+
+          print("Will process:", len(top1000), flush=True)
+
+          # ============================================================
+          # 2. 根据公钥计算 Extension ID
+          # ============================================================
+
+          def public_key_to_id(public_key):
+              digest = hashlib.sha256(public_key).digest()[:16]
+
+              return ''.join(
+                  chr(97 + (b >> 4)) + chr(97 + (b & 15))
+                  for b in digest
+              )
+
+          # ============================================================
+          # 3. Protobuf 解析
+          # ============================================================
+
+          def read_varint(data, pos):
+              value = 0
+              shift = 0
+
+              while pos < len(data):
+                  b = data[pos]
+                  pos += 1
+
+                  value |= (b & 0x7f) << shift
+
+                  if not (b & 0x80):
+                      return value, pos
+
+                  shift += 7
+
+                  if shift > 63:
+                      raise ValueError("Invalid varint")
+
+              raise ValueError("Unexpected end of protobuf")
+
+          def read_protobuf_fields(data):
+              pos = 0
+
+              while pos < len(data):
+                  tag, pos = read_varint(data, pos)
+
+                  field_number = tag >> 3
+                  wire_type = tag & 7
+
+                  if wire_type == 0:
+                      value, pos = read_varint(data, pos)
+
+                  elif wire_type == 1:
+                      value = data[pos:pos + 8]
+                      pos += 8
+
+                  elif wire_type == 2:
+                      length, pos = read_varint(data, pos)
+                      value = data[pos:pos + length]
+                      pos += length
+
+                  elif wire_type == 5:
+                      value = data[pos:pos + 4]
+                      pos += 4
+
+                  else:
+                      raise ValueError("Unsupported wire type")
+
+                  if pos > len(data):
+                      raise ValueError("Invalid protobuf length")
+
+                  yield field_number, wire_type, value
+
+          # ============================================================
+          # 4. 提取 CRX3 公钥
+          # ============================================================
+
+          def extract_crx3_public_keys(header):
+              keys = []
+
+              for field, wire_type, value in read_protobuf_fields(header):
+
+                  # sha256_with_rsa = 2
+                  # sha256_with_ecdsa = 3
+                  if field not in (2, 3) or wire_type != 2:
+                      continue
+
+                  for proof_field, proof_wire_type, proof_value in \
+                          read_protobuf_fields(value):
+
+                      # AsymmetricKeyProof.public_key = 1
+                      if proof_field == 1 and proof_wire_type == 2:
+                          keys.append(proof_value)
+
+              return keys
+
+          # ============================================================
+          # 5. 提取 CRX2 公钥
+          # ============================================================
+
+          def extract_crx2_public_key(data):
+              if len(data) < 16:
+                  raise ValueError("CRX2 header too short")
+
+              public_key_size = struct.unpack_from(
+                  "<I", data, 8
+              )[0]
+
+              start = 16
+              end = start + public_key_size
+
+              if end > len(data):
+                  raise ValueError("Invalid CRX2 public key length")
+
+              return data[start:end]
+
+          # ============================================================
+          # 6. 下载 CRX
+          # ============================================================
+
+          def download_crx(extension_id):
+              url = (
+                  "https://clients2.google.com/service/update2/crx"
+                  "?response=redirect"
+                  "&prodversion=126.0.0.0"
+                  "&acceptformat=crx3,crx2"
+                  "&x=id%3D"
+                  + extension_id
+                  + "%26uc"
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 Chrome/126.0.0.0"
+                  }
+              )
+
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=30
+                      ) as response:
+                          return response.read()
+
+                  except Exception as e:
+                      if attempt == 2:
+                          print(
+                              f"Download failed: {type(e).__name__}: {e}",
+                              flush=True
+                          )
+                          return None
+
+                      time.sleep(2 ** attempt)
+
+              return None
+
+          # ============================================================
+          # 7. 获取并验证 key
+          # ============================================================
+
+          def get_key(extension_id):
+              data = download_crx(extension_id)
+
+              if not data or len(data) < 8:
+                  return None
+
+              if data[:4] != b"Cr24":
+                  return None
+
+              version = struct.unpack_from("<I", data, 4)[0]
+
+              try:
+                  if version == 2:
+                      public_key = extract_crx2_public_key(data)
+
+                      if public_key_to_id(public_key) != extension_id:
+                          return None
+
+                      return base64.b64encode(
+                          public_key
+                      ).decode("ascii")
+
+                  elif version == 3:
+                      if len(data) < 12:
+                          return None
+
+                      header_size = struct.unpack_from(
+                          "<I", data, 8
+                      )[0]
+
+                      header_start = 12
+                      header_end = header_start + header_size
+
+                      if header_end > len(data):
+                          return None
+
+                      header = data[header_start:header_end]
+
+                      for public_key in extract_crx3_public_keys(header):
+                          if public_key_to_id(public_key) == extension_id:
+                              return base64.b64encode(
+                                  public_key
+                              ).decode("ascii")
+
+                      return None
+
+                  return None
+
+              except Exception as e:
+                  print(
+                      f"Extraction error: {type(e).__name__}: {e}",
+                      flush=True
+                  )
+                  return None
+
+          # ============================================================
+          # 8. 逐个获取 key，每完成一个立即打印
+          # ============================================================
+
+          results = []
+
+          for index, extension_id in enumerate(top1000, 1):
+
+              key = get_key(extension_id)
+
+              if key is None:
+                  key = "null"
+
+              results.append((extension_id, key))
+
+              print(
+                  f"[{index}/{len(top1000)}] "
+                  f"{index}\t{extension_id}\t{key}",
+                  flush=True
+              )
+
+              time.sleep(0.2)
+
+          # ============================================================
+          # 9. 保存结果
+          # ============================================================
+
+          output = "\n".join(
+              f"{index}\t{extension_id}\t{key}"
+              for index, (extension_id, key) in enumerate(results, 1)
+          ) + "\n"
+
+          Path("result.txt").write_text(
+              output,
+              encoding="utf-8"
+          )
+
+          print("Finished. Result saved to result.txt", flush=True)
+          PY
+
+      - name: Show result
+        run: |
+          echo "===== RESULT ====="
+          cat result.txt
+
+      - name: Write summary
+        run: |
+          {
+            echo "# Smallest 1000 Chrome Extension IDs With Keys"
+            echo
+            echo '```text'
+            cat result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: smallest-1000-extension-ids-with-keys
+          path: result.txt
